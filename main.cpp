@@ -15,7 +15,7 @@ int main() {
     tokenizer.load_token("tokenizer.model");
 
     // --- Initialize model ---
-    const int vocab = 50000, dim = 1024, hidden = 4096, layers = 24, heads = 16;
+    const int vocab = tokenizer.vocab.size(), dim = 1024, hidden = 4096, layers = 24, heads = 16;
     Model model(vocab, dim, hidden, layers, heads);
 
     // --- Example text input ---
@@ -49,3 +49,4 @@ int main() {
 
     return 0;
 }
+
