@@ -8,142 +8,231 @@
 #include <algorithm>
 #include <iostream>
 #include <set>
+#include <iomanip>
+#include <iterator>
 
 struct BPETokenizer {
-    std::unordered_map<std::string,int> vocab;
+    // ===== Core Data =====
+    std::unordered_map<std::string, int> vocab;
     std::vector<std::string> rev_vocab;
-    std::map<std::pair<std::string,std::string>,int> pair_freq;
-    std::vector<std::pair<std::string,std::string>> merges;
+    std::map<std::pair<std::string, std::string>, int> pair_freq;
+    std::vector<std::pair<std::string, std::string>> merges;
+    std::unordered_map<std::string, int> freq;
 
-    // Split text into characters
+    // ===== Special Tokens =====
+    const std::vector<std::string> special_tokens = {"<unk>", "<pad>", "<bos>", "<eos>"};
+
+    // ===== UTF-8 Aware Split =====
     static std::vector<std::string> split_chars(const std::string& text) {
         std::vector<std::string> out;
-        for(char c : text) out.push_back(std::string(1,c));
+        for (size_t i = 0; i < text.size();) {
+            unsigned char c = static_cast<unsigned char>(text[i]);
+            size_t len = 1;
+            if      ((c & 0xE0) == 0xC0) len = 2;
+            else if ((c & 0xF0) == 0xE0) len = 3;
+            else if ((c & 0xF8) == 0xF0) len = 4;
+            out.emplace_back(text.substr(i, len));
+            i += len;
+        }
         return out;
     }
 
-    // Count frequencies of symbol pairs
+    // Convert vector of tokens to string
+    static std::string word_to_string(const std::vector<std::string>& w) {
+        std::string s;
+        for (const auto& x : w) s += x;
+        return s;
+    }
+
+    // ===== Count Frequencies of Symbol Pairs =====
     void count_pairs(const std::vector<std::vector<std::string>>& corpus) {
         pair_freq.clear();
-        for(auto& word : corpus) {
-            for(size_t i=0;i+1<word.size();++i)
-                pair_freq[{word[i], word[i+1]}]++;
+        for (const auto& word : corpus) {
+            if (word.size() < 2) continue;
+            const auto key = word_to_string(word);
+            const int weight = freq.count(key) ? freq.at(key) : 1;
+            for (size_t i = 0; i + 1 < word.size(); ++i)
+                pair_freq[{word[i], word[i + 1]}] += weight;
         }
     }
 
-    // Find the most frequent pair
-    std::pair<std::string,std::string> most_frequent_pair() {
-        int best=0; std::pair<std::string,std::string> bp;
-        for(auto &p:pair_freq) {
-            if(p.second>best) { best=p.second; bp=p.first; }
+    // ===== Find Most Frequent Pair =====
+    [[nodiscard]] std::pair<std::string, std::string> most_frequent_pair() const {
+        std::pair<std::string, std::string> best_pair;
+        int best_count = 0;
+        for (const auto& [pair, count] : pair_freq) {
+            if (count > best_count) {
+                best_count = count;
+                best_pair = pair;
+            }
         }
-        return bp;
+        return best_pair;
     }
 
-    // Merge all occurrences of pair in corpus
-    void merge_pair(std::vector<std::vector<std::string>>& corpus,
-                    const std::pair<std::string,std::string>& pair) {
-        std::string merged = pair.first + pair.second;
-        for(auto &word:corpus){
+    // ===== Merge a Pair in Corpus =====
+    static void merge_pair(std::vector<std::vector<std::string>>& corpus,
+                           const std::pair<std::string, std::string>& pair) {
+        const std::string merged = pair.first + pair.second;
+        for (auto& word : corpus) {
             std::vector<std::string> new_word;
-            for(size_t i=0;i<word.size();) {
-                if(i+1<word.size() && word[i]==pair.first && word[i+1]==pair.second) {
+            for (size_t i = 0; i < word.size();) {
+                if (i + 1 < word.size() && word[i] == pair.first && word[i + 1] == pair.second) {
                     new_word.push_back(merged);
-                    i+=2;
+                    i += 2;
                 } else {
-                    new_word.push_back(word[i]);
-                    i++;
+                    new_word.push_back(word[i++]);
                 }
             }
             word.swap(new_word);
         }
     }
 
-    void train(const std::string& text_path, int vocab_size=50000, int verbose=1) {
+    // ===== Train BPE Tokenizer =====
+    void train(const std::string& text_path, int vocab_size = 50000, bool verbose = true) {
         std::ifstream f(text_path);
-        if(!f.is_open()){ std::cerr<<"Tokenizer: cannot open "<<text_path<<"\n"; return;}
+        if (!f) {
+            std::cerr << "[BPE] Error: cannot open file: " << text_path << "\n";
+            return;
+        }
+
+        freq.clear();
         std::string word;
-        std::unordered_map<std::string,int> freq;
-        while(f>>word) freq[word]++;
+        while (f >> word)
+            freq["▁" + word]++;
+
         std::vector<std::vector<std::string>> corpus;
-        for(auto &p:freq){
-            auto chars = split_chars(p.first);
-            corpus.push_back(chars);
+        corpus.reserve(freq.size());
+        for (const auto& [w, _] : freq)
+            corpus.push_back(split_chars(w));
+
+        // ===== Initialize Vocab =====
+        vocab.clear();
+        rev_vocab.clear();
+        for (const auto& t : special_tokens) {
+            vocab[t] = static_cast<int>(vocab.size());
+            rev_vocab.push_back(t);
         }
 
-        // initial vocab: single characters
         std::set<std::string> symbols;
-        for(auto &p:freq){
-            for(char c: p.first) symbols.insert(std::string(1,c));
-        }
-        for(auto &s:symbols) vocab[s]=(int)vocab.size();
-        for(auto &p:vocab) rev_vocab.push_back(p.first);
+        for (const auto& [w, _] : freq)
+            for (const auto& c : split_chars(w))
+                symbols.insert(c);
 
-        while((int)vocab.size() < vocab_size) {
+        for (const auto& s : symbols) {
+            vocab[s] = static_cast<int>(vocab.size());
+            rev_vocab.push_back(s);
+        }
+
+        // ===== BPE Merging Loop =====
+        while (static_cast<int>(vocab.size()) < vocab_size) {
             count_pairs(corpus);
             auto best_pair = most_frequent_pair();
-            if(pair_freq[best_pair] < 2) break; // no useful merges
-            merge_pair(corpus,best_pair);
-            std::string merged = best_pair.first + best_pair.second;
-            vocab[merged]=(int)vocab.size();
+            if (pair_freq.empty() || pair_freq[best_pair] < 2) break;
+
+            merge_pair(corpus, best_pair);
+            const std::string merged = best_pair.first + best_pair.second;
+            vocab[merged] = static_cast<int>(vocab.size());
             rev_vocab.push_back(merged);
             merges.push_back(best_pair);
-            if(verbose && vocab.size()%1000==0)
+
+            if (verbose && vocab.size() % 1000 == 0)
                 std::cout << "[BPE] Merges: " << vocab.size() << "\n";
         }
-        std::cout << "BPE training done. vocab="<<vocab.size()<<"\n";
+
+        if (verbose)
+            std::cout << "[BPE] Training complete. Final vocab size = " << vocab.size() << "\n";
     }
 
-    std::vector<std::string> apply_bpe(const std::vector<std::string>& chars) const {
-        std::vector<std::string> tokens = chars;
-        bool changed = true;
-        while(changed) {
-            changed = false;
-            for(auto &pair: merges) {
-                for(size_t i=0;i+1<tokens.size();) {
-                    if(tokens[i]==pair.first && tokens[i+1]==pair.second) {
-                        tokens[i]=pair.first+pair.second;
-                        tokens.erase(tokens.begin()+i+1);
-                        changed=true;
-                    } else ++i;
-                }
+    // ===== Apply Merges =====
+    [[nodiscard]] std::vector<std::string> apply_bpe(std::vector<std::string> tokens) const {
+        for (const auto& [a, b] : merges) {
+            for (size_t i = 0; i + 1 < tokens.size();) {
+                if (tokens[i] == a && tokens[i + 1] == b) {
+                    tokens[i] = a + b;
+                    tokens.erase(tokens.begin() + i + 1);
+                } else ++i;
             }
         }
         return tokens;
     }
 
-    std::vector<int> encode(const std::string& text) const {
+    // ===== Encode / Decode =====
+    [[nodiscard]] std::vector<int> encode(const std::string& text) const {
         std::istringstream iss(text);
         std::string word;
         std::vector<int> out;
-        while(iss>>word){
-            auto chars=split_chars(word);
-            auto merged=apply_bpe(chars);
-            for(auto&t:merged){
-                auto it=vocab.find(t);
-                out.push_back(it==vocab.end()?0:it->second);
+        while (iss >> word) {
+            auto chars = split_chars("▁" + word);
+            auto merged = apply_bpe(std::move(chars));
+            for (const auto& t : merged) {
+                if (auto it = vocab.find(t); it != vocab.end())
+                    out.push_back(it->second);
+                else
+                    out.push_back(vocab.at("<unk>"));
             }
         }
         return out;
     }
 
-    std::string decode(const std::vector<int>& tokens) const {
+    [[nodiscard]] std::string decode(const std::vector<int>& tokens) const {
         std::string out;
-        for(int t:tokens) out += rev_vocab[t];
+        for (int t : tokens) {
+            if (t >= 0 && t < static_cast<int>(rev_vocab.size()))
+                out += rev_vocab[t];
+        }
+        std::replace(out.begin(), out.end(), '▁', ' ');
         return out;
     }
 
-    void save(const std::string& path) const {
+    // ===== Save / Load =====
+    void save_token(const std::string& path) const {
         std::ofstream f(path);
-        for(auto &p:merges)
-            f << p.first << " " << p.second << "\n";
+        if (!f) {
+            std::cerr << "[BPE] Error: cannot write to file: " << path << "\n";
+            return;
+        }
+        f << "#vocab " << vocab.size() << "\n";
+        for (const auto& [token, id] : vocab)
+            f << token << " " << id << "\n";
+
+        f << "#merges " << merges.size() << "\n";
+        for (const auto& [a, b] : merges)
+            f << a << " " << b << "\n";
     }
 
-    void load(const std::string& path) {
+    void load_token(const std::string& path) {
+        vocab.clear();
+        rev_vocab.clear();
         merges.clear();
+
         std::ifstream f(path);
-        std::string a,b;
-        while(f>>a>>b)
-            merges.push_back({a,b});
+        if (!f) {
+            std::cerr << "[BPE] Error: cannot open token file: " << path << "\n";
+            return;
+        }
+
+        std::string header;
+        while (f >> header) {
+            if (header == "#vocab") {
+                size_t n; f >> n;
+                for (size_t i = 0; i < n; ++i) {
+                    std::string token; int id;
+                    f >> token >> id;
+                    vocab[token] = id;
+                }
+                rev_vocab.resize(vocab.size());
+                for (const auto& [tok, id] : vocab)
+                    if (id >= 0 && id < static_cast<int>(rev_vocab.size()))
+                        rev_vocab[id] = tok;
+            } else if (header == "#merges") {
+                size_t m; f >> m;
+                merges.reserve(m);
+                for (size_t i = 0; i < m; ++i) {
+                    std::string a, b;
+                    f >> a >> b;
+                    merges.emplace_back(a, b);
+                }
+            }
+        }
     }
 };
